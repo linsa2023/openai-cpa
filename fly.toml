@@ -1,10 +1,10 @@
-# fly.toml app configuration file generated for openai-cpa-bfenfw on 2026-04-19T17:36:35Z
+# fly.toml app configuration file generated for openai-cpa-8zzojq on 2026-04-20T15:32:34Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'openai-cpa-bfenfw'
-primary_region = 'ams'
+app = 'openai-cpa-8zzojq'
+primary_region = 'lhr'
 
 [build]
 
@@ -21,6 +21,3 @@ primary_region = 'ams'
   cpu_kind = 'shared'
   cpus = 1
   memory_mb = 512
-[mounts]
-  source = "cpa_data"
-  destination = "app/data"
