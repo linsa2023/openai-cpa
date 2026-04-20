@@ -23,4 +23,4 @@ primary_region = 'ams'
   memory_mb = 512
 [mounts]
   source = "cpa_data"
-  destination = "/data"
+  destination = "app/data"
