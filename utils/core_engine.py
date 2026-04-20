@@ -34,6 +34,7 @@ from utils.proxy_manager import smart_switch_node
 from utils.integrations.sub2api_client import Sub2APIClient
 from utils.integrations.tg_notifier import send_tg_msg_sync
 
+
 _stats_lock = threading.Lock()
 sub_fail_counts = {}
 _heal_lock = threading.Lock()
@@ -55,11 +56,30 @@ KNOWN_CLIPROXY_ERROR_LABELS = {
     "unsupported_region":   "地区不支持",
 }
 
-log_queue = queue.Queue(maxsize=500)
 _orig_print  = builtins.print
 _thread_local = threading.local()
 _print_lock   = threading.Lock()
 
+
+class FakeLogQueue:
+    def put_nowait(self, item):
+        try:
+            from global_state import append_log
+            if isinstance(item, str):
+                append_log(item.strip())
+            else:
+                append_log(str(item).strip())
+        except Exception:
+            pass
+    def put(self, item, block=True, timeout=None):
+        self.put_nowait(item)
+
+    def empty(self):
+        return True
+
+    def qsize(self):
+        return 0
+log_queue = FakeLogQueue()
 
 def web_print(*args, **kwargs):
     if "file" in kwargs and kwargs["file"] is not None:
@@ -76,8 +96,9 @@ def web_print(*args, **kwargs):
             msg = _thread_local.buffer.lstrip("\n")
             if msg and msg.strip() != ".":
                 try:
-                    log_queue.put_nowait(msg.strip())
-                except queue.Full:
+                    from global_state import append_log
+                    append_log(msg.strip())
+                except Exception:
                     pass
         _thread_local.buffer = ""
 
@@ -196,6 +217,41 @@ def _extract_remaining_percent(window_info: Any) -> Optional[float]:
     if isinstance(used_percent, (int, float)):
         return max(0.0, min(100.0, 100.0 - float(used_percent)))
     return None
+
+
+def _should_reenable_cpa_account(raw_usage: Any, threshold: int) -> Tuple[bool, str]:
+    """
+    Fail-closed 恢复判定：只有能明确确认额度高于阈值时才允许重新启用。
+    返回 (可否启用, 原因描述)。
+    """
+    if not isinstance(raw_usage, dict):
+        return False, "无法读取用量数据"
+    payload = raw_usage
+    body = raw_usage.get("body")
+    if isinstance(body, str):
+        try:
+            payload = json.loads(body)
+        except Exception:
+            return False, "无法解析用量响应体"
+    if not isinstance(payload, dict):
+        return False, "用量数据格式异常"
+    rate_limit = payload.get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        return False, "缺少 rate_limit 数据"
+    if rate_limit.get("allowed") is False or rate_limit.get("limit_reached") is True:
+        return False, (
+            f"限额标记未恢复（allowed={rate_limit.get('allowed')}, "
+            f"limit_reached={rate_limit.get('limit_reached')}）"
+        )
+    pct = _extract_remaining_percent(rate_limit.get("primary_window"))
+    if pct is None:
+        return False, "无法确认剩余额度百分比（primary_window 缺失）"
+    effective = max(threshold, 1)
+    if pct < effective:
+        pct_s = _format_percent(pct)
+        detail = f"，低于阈值 {threshold}%" if threshold > 0 else ""
+        return False, f"周限额剩余 {pct_s}%{detail}"
+    return True, f"周限额剩余 {_format_percent(pct)}%"
 
 
 def _format_percent(value: float) -> str:
@@ -371,6 +427,12 @@ def process_account_worker(i: int, total: int, item: dict, args: Any) -> bool:
 
     if is_ok:
         if is_disabled:
+            can_reenable, reason = _should_reenable_cpa_account(
+                item.get("_raw_usage"), cfg.MIN_REMAINING_WEEKLY_PERCENT
+            )
+            if not can_reenable:
+                print(f"[{ts()}] [INFO] 测活: {mask_email(name)} 额度尚未恢复（{reason}），继续保持禁用状态。")
+                return False
             print(f"[{ts()}] [INFO] 测活: {mask_email(name)} 额度已恢复且有效，准备启用...")
             ok = set_cpa_auth_file_status(cfg.CPA_API_URL, cfg.CPA_API_TOKEN, name, disabled=False)
             print(
@@ -819,7 +881,7 @@ def process_sub2api_worker(i: int, total: int, item: dict, client: Any, args: An
     _handle_sub2api_dead_account(item, client, is_disabled=False)
     return False
 
-def normal_main_loop(args, stop_event: threading.Event):
+def normal_main_loop(args, stop_event: threading.Event, executor=None):
     """常规量产模式（纯数据库保存）"""
     sleep_min    = max(1, cfg.NORMAL_SLEEP_MIN)
     sleep_max    = max(sleep_min, cfg.NORMAL_SLEEP_MAX)
@@ -859,6 +921,14 @@ def normal_main_loop(args, stop_event: threading.Event):
 
                 def _worker():
                     if stop_event.is_set(): return "stopped"
+                    if cfg.is_raw_proxy_pool_enabled():
+                        borrowed_generation, p = cfg.unpack_proxy_queue_item(cfg.PROXY_QUEUE.get())
+                        try:
+                            return run_and_refresh(p, args, False, skip_switch=True)
+                        finally:
+                            if cfg.should_return_pooled_proxy(borrowed_generation):
+                                cfg.PROXY_QUEUE.put(cfg.make_proxy_queue_item(p, borrowed_generation))
+                                cfg.PROXY_QUEUE.task_done()
                     if cfg._clash_enable and cfg._clash_pool_mode:
                         p = cfg.PROXY_QUEUE.get()
                         try:
@@ -868,13 +938,27 @@ def normal_main_loop(args, stop_event: threading.Event):
                             cfg.PROXY_QUEUE.task_done()
                     return run_and_refresh(args.proxy, args, False, skip_switch=True)
 
-                with ThreadPoolExecutor(max_workers=current_batch) as ex:
-                    futures = [ex.submit(_worker) for _ in range(current_batch)]
+                if executor is not None:
+                    futures = [executor.submit(_worker) for _ in range(current_batch)]
                     for f in futures:
                         if f.result() == "success":
                             success_count += 1
+                else:
+                    with ThreadPoolExecutor(max_workers=current_batch) as ex:
+                        futures = [ex.submit(_worker) for _ in range(current_batch)]
+                        for f in futures:
+                            if f.result() == "success":
+                                success_count += 1
             else:
-                if cfg._clash_enable and cfg._clash_pool_mode:
+                if cfg.is_raw_proxy_pool_enabled():
+                    borrowed_generation, p = cfg.unpack_proxy_queue_item(cfg.PROXY_QUEUE.get())
+                    try:
+                        status = run_and_refresh(p, args, False, skip_switch=True)
+                    finally:
+                        if cfg.should_return_pooled_proxy(borrowed_generation):
+                            cfg.PROXY_QUEUE.put(cfg.make_proxy_queue_item(p, borrowed_generation))
+                            cfg.PROXY_QUEUE.task_done()
+                elif cfg._clash_enable and cfg._clash_pool_mode:
                     p = cfg.PROXY_QUEUE.get()
                     try:
                         status = run_and_refresh(p, args, False, skip_switch=False)
@@ -903,7 +987,7 @@ def normal_main_loop(args, stop_event: threading.Event):
             break
 
 
-async def perform_cpa_check(args, async_stop_event, loop):
+async def perform_cpa_check(args, async_stop_event, loop, executor=None):
     print(f"[{ts()}] [INFO] 开始执行 CPA 仓库全量测活巡检...")
     res = requests.get(
         _normalize_cpa_auth_files_url(cfg.CPA_API_URL),
@@ -918,19 +1002,26 @@ async def perform_cpa_check(args, async_stop_event, loop):
     ]
     total_files = len(codex_files)
 
-    with ThreadPoolExecutor(max_workers=cfg.CPA_THREADS) as executor:
+    if executor is not None:
         futures = [
             loop.run_in_executor(executor, process_account_worker, i, total_files, item, args)
             for i, item in enumerate(codex_files, 1)
         ]
         results = await asyncio.gather(*futures)
+    else:
+        with ThreadPoolExecutor(max_workers=cfg.CPA_THREADS) as _ex:
+            futures = [
+                loop.run_in_executor(_ex, process_account_worker, i, total_files, item, args)
+                for i, item in enumerate(codex_files, 1)
+            ]
+            results = await asyncio.gather(*futures)
 
     valid_count = sum(1 for r in results if r)
     print(f"[{ts()}] [INFO] CPA 测活结束，当前有效数: {valid_count} / {total_files}")
     return valid_count, total_files
 
 
-async def perform_sub2api_check(args, async_stop_event, loop, client):
+async def perform_sub2api_check(args, async_stop_event, loop, client, executor=None):
     print(f"[{ts()}] [INFO] 开始执行 Sub2API 仓库全量测活巡检...")
     success, account_list = client.get_all_accounts()
     if not success:
@@ -939,28 +1030,35 @@ async def perform_sub2api_check(args, async_stop_event, loop, client):
 
     total_files = len(account_list)
 
-    with ThreadPoolExecutor(max_workers=cfg.SUB2API_THREADS) as executor:
+    if executor is not None:
         futures = [
             loop.run_in_executor(executor, process_sub2api_worker, i, total_files, item, client, args)
             for i, item in enumerate(account_list, 1)
         ]
         results = await asyncio.gather(*futures)
+    else:
+        with ThreadPoolExecutor(max_workers=cfg.SUB2API_THREADS) as _ex:
+            futures = [
+                loop.run_in_executor(_ex, process_sub2api_worker, i, total_files, item, client, args)
+                for i, item in enumerate(account_list, 1)
+            ]
+            results = await asyncio.gather(*futures)
 
     valid_count = sum(1 for r in results if r)
     print(f"[{ts()}] [INFO] Sub2API 测活结束，当前有效数: {valid_count} / {total_files}")
     return valid_count, total_files
 
-async def manual_check_main_loop(args, async_stop_event: asyncio.Event):
+async def manual_check_main_loop(args, async_stop_event: asyncio.Event, executor=None):
     print("=" * 60)
     print(f"\n[{ts()}] [系统] >>> 启动独立测活清理任务 <<<")
     print("=" * 60)
     loop = asyncio.get_running_loop()
 
     if cfg.ENABLE_CPA_MODE:
-        await perform_cpa_check(args, async_stop_event, loop)
+        await perform_cpa_check(args, async_stop_event, loop, executor=executor)
     elif cfg.ENABLE_SUB2API_MODE:
         client = Sub2APIClient(api_url=cfg.SUB2API_URL, api_key=cfg.SUB2API_KEY)
-        await perform_sub2api_check(args, async_stop_event, loop, client)
+        await perform_sub2api_check(args, async_stop_event, loop, client, executor=executor)
     else:
         print(f"[{ts()}] [WARNING] 当前未开启 CPA 或 Sub2API 模式，无法执行仓管测活。")
 
@@ -969,7 +1067,7 @@ async def manual_check_main_loop(args, async_stop_event: asyncio.Event):
     async_stop_event.set()
 
 
-async def cpa_main_loop(args, async_stop_event: asyncio.Event):
+async def cpa_main_loop(args, async_stop_event: asyncio.Event, executor=None):
     """CPA 智能仓管模式（接入发牌器，防止撞车）。"""
     print("=" * 60)
     print(f"\n[{ts()}] [系统] 目标库存阈值: {cfg.MIN_ACCOUNTS_THRESHOLD} | 单次补发量: {cfg.BATCH_REG_COUNT}")
@@ -985,7 +1083,7 @@ async def cpa_main_loop(args, async_stop_event: asyncio.Event):
     while not async_stop_event.is_set() and not cfg.POOL_EXHAUSTED:
         try:
             if cfg.CPA_AUTO_CHECK:
-                valid_count, total_files = await perform_cpa_check(args, async_stop_event, loop)
+                valid_count, total_files = await perform_cpa_check(args, async_stop_event, loop, executor=executor)
             else:
                 print(f"\n[{ts()}] [INFO] 自动测活已关闭，直接读取云端列表进行补发判断...")
                 res = requests.get(
@@ -1013,6 +1111,14 @@ async def cpa_main_loop(args, async_stop_event: asyncio.Event):
 
                 def _cpa_worker():
                     if async_stop_event.is_set(): return "stopped"
+                    if cfg.is_raw_proxy_pool_enabled():
+                        borrowed_generation, p = cfg.unpack_proxy_queue_item(cfg.PROXY_QUEUE.get())
+                        try:
+                            return run_and_refresh(p, args, cpa_upload=True, skip_switch=True)
+                        finally:
+                            if cfg.should_return_pooled_proxy(borrowed_generation):
+                                cfg.PROXY_QUEUE.put(cfg.make_proxy_queue_item(p, borrowed_generation))
+                                cfg.PROXY_QUEUE.task_done()
                     if cfg._clash_enable and cfg._clash_pool_mode:
                         p = cfg.PROXY_QUEUE.get()
                         try:
@@ -1034,12 +1140,19 @@ async def cpa_main_loop(args, async_stop_event: asyncio.Event):
                     if cfg.ENABLE_MULTI_THREAD_REG:
                         print(f"[{ts()}] [INFO] 多线程补货: {success_in_this_cycle}/{need_to_reg} "
                               f"({batch_size} 线程)")
-                        with ThreadPoolExecutor(max_workers=batch_size) as ex:
+                        if executor is not None:
                             reg_futures = [
-                                loop.run_in_executor(ex, _cpa_worker)
+                                loop.run_in_executor(executor, _cpa_worker)
                                 for _ in range(batch_size)
                             ]
                             reg_results = await asyncio.gather(*reg_futures)
+                        else:
+                            with ThreadPoolExecutor(max_workers=batch_size) as ex:
+                                reg_futures = [
+                                    loop.run_in_executor(ex, _cpa_worker)
+                                    for _ in range(batch_size)
+                                ]
+                                reg_results = await asyncio.gather(*reg_futures)
                         for status in reg_results:
                             if status == "success":
                                 success_in_this_cycle += 1
@@ -1048,7 +1161,15 @@ async def cpa_main_loop(args, async_stop_event: asyncio.Event):
                                 await asyncio.sleep(15)
                     else:
                         print(f"[{ts()}] [INFO] 单线程补货: {success_in_this_cycle}/{need_to_reg}")
-                        if cfg._clash_enable and cfg._clash_pool_mode:
+                        if cfg.is_raw_proxy_pool_enabled():
+                            borrowed_generation, p = cfg.unpack_proxy_queue_item(cfg.PROXY_QUEUE.get())
+                            try:
+                                status = await loop.run_in_executor(None, run_and_refresh, p, args, True, True)
+                            finally:
+                                if cfg.should_return_pooled_proxy(borrowed_generation):
+                                    cfg.PROXY_QUEUE.put(cfg.make_proxy_queue_item(p, borrowed_generation))
+                                    cfg.PROXY_QUEUE.task_done()
+                        elif cfg._clash_enable and cfg._clash_pool_mode:
                             p = cfg.PROXY_QUEUE.get()
                             try:
                                 status = await loop.run_in_executor(None, run_and_refresh, p, args, True, False)
@@ -1089,7 +1210,7 @@ async def cpa_main_loop(args, async_stop_event: asyncio.Event):
             except asyncio.TimeoutError:
                 pass
 
-async def sub2api_main_loop(args, async_stop_event: asyncio.Event):
+async def sub2api_main_loop(args, async_stop_event: asyncio.Event, executor=None):
     """Sub2API 智能仓管模式"""
     print("=" * 60)
     print(f"\n[{ts()}] [系统] Sub2API 目标库存阈值: {cfg.SUB2API_MIN_THRESHOLD} | 单次补发量: {cfg.SUB2API_BATCH_COUNT}")
@@ -1113,12 +1234,19 @@ async def sub2api_main_loop(args, async_stop_event: asyncio.Event):
 
                 total_files = len(account_list)
 
-                with ThreadPoolExecutor(max_workers=cfg.SUB2API_THREADS) as executor:
+                if executor is not None:
                     futures = [
                         loop.run_in_executor(executor, process_sub2api_worker, i, total_files, item, client, args)
                         for i, item in enumerate(account_list, 1)
                     ]
                     results = await asyncio.gather(*futures)
+                else:
+                    with ThreadPoolExecutor(max_workers=cfg.SUB2API_THREADS) as _ex:
+                        futures = [
+                            loop.run_in_executor(_ex, process_sub2api_worker, i, total_files, item, client, args)
+                            for i, item in enumerate(account_list, 1)
+                        ]
+                        results = await asyncio.gather(*futures)
 
                 valid_count = sum(1 for r in results if r)
                 print(f"[{ts()}] [INFO] 巡检结束，当前 Sub2API 仓库有效数: {valid_count}")
@@ -1163,6 +1291,14 @@ async def sub2api_main_loop(args, async_stop_event: asyncio.Event):
 
                 def _sub2api_worker():
                     if async_stop_event.is_set(): return "stopped"
+                    if cfg.is_raw_proxy_pool_enabled():
+                        borrowed_generation, p = cfg.unpack_proxy_queue_item(cfg.PROXY_QUEUE.get())
+                        try:
+                            return _sub2api_run_wrapper(p, True)
+                        finally:
+                            if cfg.should_return_pooled_proxy(borrowed_generation):
+                                cfg.PROXY_QUEUE.put(cfg.make_proxy_queue_item(p, borrowed_generation))
+                                cfg.PROXY_QUEUE.task_done()
                     if cfg._clash_enable and cfg._clash_pool_mode:
                         p = cfg.PROXY_QUEUE.get()
                         try:
@@ -1184,12 +1320,19 @@ async def sub2api_main_loop(args, async_stop_event: asyncio.Event):
                     if cfg.ENABLE_MULTI_THREAD_REG:
                         print(f"[{ts()}] [INFO] 多线程补货: {success_in_this_cycle}/{need_to_reg} "
                               f"({batch_size} 线程)")
-                        with ThreadPoolExecutor(max_workers=batch_size) as ex:
+                        if executor is not None:
                             reg_futures = [
-                                loop.run_in_executor(ex, _sub2api_worker)
+                                loop.run_in_executor(executor, _sub2api_worker)
                                 for _ in range(batch_size)
                             ]
                             reg_results = await asyncio.gather(*reg_futures)
+                        else:
+                            with ThreadPoolExecutor(max_workers=batch_size) as ex:
+                                reg_futures = [
+                                    loop.run_in_executor(ex, _sub2api_worker)
+                                    for _ in range(batch_size)
+                                ]
+                                reg_results = await asyncio.gather(*reg_futures)
 
                         for status in reg_results:
                             if status == "success":
@@ -1201,7 +1344,15 @@ async def sub2api_main_loop(args, async_stop_event: asyncio.Event):
 
                     else:
                         print(f"[{ts()}] [INFO] 单线程补货: {success_in_this_cycle}/{need_to_reg}")
-                        if cfg._clash_enable and cfg._clash_pool_mode:
+                        if cfg.is_raw_proxy_pool_enabled():
+                            borrowed_generation, p = cfg.unpack_proxy_queue_item(cfg.PROXY_QUEUE.get())
+                            try:
+                                status = await loop.run_in_executor(None, _sub2api_run_wrapper, p, True)
+                            finally:
+                                if cfg.should_return_pooled_proxy(borrowed_generation):
+                                    cfg.PROXY_QUEUE.put(cfg.make_proxy_queue_item(p, borrowed_generation))
+                                    cfg.PROXY_QUEUE.task_done()
+                        elif cfg._clash_enable and cfg._clash_pool_mode:
                             p = cfg.PROXY_QUEUE.get()
                             try:
                                 status = await loop.run_in_executor(None, _sub2api_run_wrapper, p, False)
@@ -1274,13 +1425,31 @@ def main() -> None:
 
 class RegEngine:
     """GUI 用控制类，封装线程/协程生命周期。"""
-
     def __init__(self):
         self.thread_stop_event = threading.Event()
         self.async_stop_event  = None
         self.current_thread    = None
         self.loop              = None
         self._force_stopped    = False
+        self._executor         = None
+
+    def _ensure_executor(self, max_workers=None):
+        if self._executor is None:
+            workers = max_workers or max(cfg.REG_THREADS, getattr(cfg, 'CPA_THREADS', 4), getattr(cfg, 'SUB2API_THREADS', 4))
+            self._executor = ThreadPoolExecutor(max_workers=workers)
+        return self._executor
+
+    def _shutdown_executor(self):
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+            self._executor = None
+
+    def _finalize_thread_run(self):
+        if self.loop is not None:
+            self.loop.close()
+            self.loop = None
+        self.async_stop_event = None
+        self._shutdown_executor()
 
     def start_normal(self, args):
         if self.is_running():
@@ -1290,9 +1459,10 @@ class RegEngine:
         cfg.POOL_EXHAUSTED = False
         self.thread_stop_event.clear()
         args.check_stop = lambda: self.thread_stop_event.is_set()
+        self._ensure_executor()
         self.current_thread = threading.Thread(
-            target=normal_main_loop,
-            args=(args, self.thread_stop_event),
+            target=self._run_normal_in_thread,
+            args=(args,),
             daemon=True,
         )
         self.current_thread.start()
@@ -1304,6 +1474,7 @@ class RegEngine:
         cfg.GLOBAL_STOP = False
         cfg.POOL_EXHAUSTED = False
         self.thread_stop_event.clear()
+        self._ensure_executor()
         self.current_thread = threading.Thread(
             target=self._run_cpa_in_thread, args=(args,), daemon=True
         )
@@ -1316,6 +1487,7 @@ class RegEngine:
         cfg.GLOBAL_STOP = False
         cfg.POOL_EXHAUSTED = False
         self.thread_stop_event.clear()
+        self._ensure_executor()
         self.current_thread = threading.Thread(
             target=self._run_sub2api_in_thread, args=(args,), daemon=True
         )
@@ -1327,20 +1499,26 @@ class RegEngine:
         try:
             self.loop.run_until_complete(self._cpa_wrapper(args))
         finally:
-            self.loop.close()
+            self._finalize_thread_run()
+
+    def _run_normal_in_thread(self, args):
+        try:
+            normal_main_loop(args, self.thread_stop_event, executor=self._executor)
+        finally:
+            self._finalize_thread_run()
 
     def _run_sub2api_in_thread(self, args):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         try:
             self.async_stop_event = asyncio.Event()
-            self.loop.run_until_complete(sub2api_main_loop(args, self.async_stop_event))
+            self.loop.run_until_complete(sub2api_main_loop(args, self.async_stop_event, executor=self._executor))
         finally:
-            self.loop.close()
+            self._finalize_thread_run()
             
     async def _cpa_wrapper(self, args):
         self.async_stop_event = asyncio.Event()
-        await cpa_main_loop(args, self.async_stop_event)
+        await cpa_main_loop(args, self.async_stop_event, executor=self._executor)
 
     def stop(self):
         self._force_stopped = True
@@ -1349,6 +1527,14 @@ class RegEngine:
         self.thread_stop_event.set()
         if self.loop and self.async_stop_event:
             self.loop.call_soon_threadsafe(self.async_stop_event.set)
+
+        self._shutdown_executor()
+
+        try:
+            from utils.email_providers.postman_center import global_postman_fleet
+            global_postman_fleet.clear_fleet()
+        except Exception:
+            pass
 
     def is_running(self) -> bool:
         if self._force_stopped:
@@ -1361,6 +1547,7 @@ class RegEngine:
         cfg.GLOBAL_STOP = False
         cfg.POOL_EXHAUSTED = False
         self.thread_stop_event.clear()
+        self._ensure_executor()
         self.current_thread = threading.Thread(
             target=self._run_check_in_thread, args=(args,), daemon=True
         )
@@ -1371,9 +1558,9 @@ class RegEngine:
         asyncio.set_event_loop(self.loop)
         try:
             self.async_stop_event = asyncio.Event()
-            self.loop.run_until_complete(manual_check_main_loop(args, self.async_stop_event))
+            self.loop.run_until_complete(manual_check_main_loop(args, self.async_stop_event, executor=self._executor))
         finally:
-            self.loop.close()
+            self._finalize_thread_run()
             self._force_stopped = True
 
 if __name__ == "__main__":
